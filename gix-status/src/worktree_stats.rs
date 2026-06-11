@@ -28,9 +28,15 @@ use bstr::BString;
 /// defaults to `core.filemode=false`, so all five are simply omitted here.
 #[derive(Debug, Clone, Default)]
 pub struct WorktreeStat {
-    /// Whether this is a directory.
+    /// Whether this is a directory, with the same semantics as
+    /// `std::fs::symlink_metadata`: `false` for directory symlinks and junctions
+    /// even though the filesystem also marks those with the directory attribute.
     pub is_dir: bool,
-    /// Whether this is a symlink (or reparse point on Windows).
+    /// Whether this is a symlink, with the same semantics as
+    /// `std::fs::symlink_metadata`: `true` only for name-surrogate reparse points
+    /// (symlinks and junctions/mount points). Other reparse points — OneDrive
+    /// cloud placeholders, ProjFS, app-exec links — are regular files/dirs, as
+    /// the live `lstat` fallback would report them.
     pub is_symlink: bool,
     /// File size in bytes.
     pub size: u64,
@@ -204,6 +210,18 @@ mod windows {
     type WorkItem = (Vec<u16>, String);
 
     /// Convert FILE_ID_BOTH_DIR_INFO to a [`WorktreeStat`].
+    ///
+    /// File-type flags must mirror what the live fallback
+    /// (`gix_index::fs::Metadata`, i.e. `std::fs::symlink_metadata`) reports for
+    /// the same path, or cache hits and misses would disagree on the type and
+    /// misreport unchanged entries as type-changed or removed. std only calls a
+    /// reparse point a symlink if its tag is a *name surrogate* (symlinks and
+    /// junctions), and reports `is_dir=false` for those; non-surrogate reparse
+    /// points (OneDrive cloud placeholders, ProjFS, app-exec links, WOF) are
+    /// plain files/directories to std. Directory enumeration stores the reparse
+    /// tag in `EaSize` when `FILE_ATTRIBUTE_REPARSE_POINT` is set (MS-FSCC
+    /// 2.4.17, same convention as `WIN32_FIND_DATA::dwReserved0`), so we can
+    /// replicate that logic without extra syscalls.
     fn stat_from_info(info: &FILE_ID_BOTH_DIR_INFO) -> WorktreeStat {
         let size = info.EndOfFile as u64;
 
@@ -215,8 +233,7 @@ mod windows {
         let (mtime_secs, mtime_nsecs) = filetime_to_unix(info.LastWriteTime as u64);
         let (ctime_secs, ctime_nsecs) = filetime_to_unix(info.CreationTime as u64);
 
-        let is_dir = (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        let is_symlink = (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        let (is_dir, is_symlink) = type_flags_from_attributes(info.FileAttributes, info.EaSize);
 
         WorktreeStat {
             is_dir,
@@ -227,6 +244,20 @@ mod windows {
             ctime_secs,
             ctime_nsecs,
         }
+    }
+
+    /// Derive `(is_dir, is_symlink)` exactly like `std::fs::FileType` does for
+    /// `symlink_metadata`, given raw directory-enumeration data. `reparse_tag`
+    /// is `EaSize` reinterpreted, only meaningful when the reparse attribute is set.
+    pub(super) fn type_flags_from_attributes(attributes: u32, reparse_tag: u32) -> (bool, bool) {
+        /// `IsReparseTagNameSurrogate`: the tag names another filesystem object
+        /// (symlink, junction/mount point), as opposed to tags that overlay data
+        /// onto the file itself (cloud placeholders, WOF, ProjFS, ...).
+        const NAME_SURROGATE_BIT: u32 = 0x2000_0000;
+        let is_reparse = attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        let is_symlink = is_reparse && (reparse_tag & NAME_SURROGATE_BIT) != 0;
+        let is_dir = !is_symlink && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        (is_dir, is_symlink)
     }
 
     /// Convert a Windows FILETIME (100ns intervals since 1601-01-01 UTC) to Unix (secs, nsecs).
@@ -322,6 +353,9 @@ mod windows {
 
             let mut offset = 0usize;
             loop {
+                // Alignment is guaranteed: the buffer is `Vec<u64>` (8-byte aligned) and the
+                // kernel emits entries at 8-byte-aligned `NextEntryOffset`s within it.
+                #[allow(clippy::cast_ptr_alignment)]
                 let info_ptr = unsafe { buffer.as_ptr().cast::<u8>().add(offset).cast::<FILE_ID_BOTH_DIR_INFO>() };
                 let info = unsafe { &*info_ptr };
 
@@ -332,8 +366,11 @@ mod windows {
                 let is_dotdot = name_len == 2 && name_slice[0] == b'.' as u16 && name_slice[1] == b'.' as u16;
 
                 if !is_dot && !is_dotdot && !name_is_dotgit(name_slice) {
-                    let is_dir = (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                    let is_reparse = (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                    // Recurse only into what the live pipeline would consider a directory:
+                    // name-surrogate reparse points (junctions, directory symlinks) are
+                    // symlinks to it and must not be followed — that's also what protects
+                    // the walk from filesystem cycles.
+                    let (is_dir, _is_symlink) = type_flags_from_attributes(info.FileAttributes, info.EaSize);
 
                     // Build the worktree-relative path in a single allocation by decoding the
                     // UTF-16 name straight into a string already holding `rel_prefix/`, instead
@@ -369,7 +406,7 @@ mod windows {
 
                     if valid {
                         let stat = stat_from_info(info);
-                        if is_dir && !is_reparse {
+                        if is_dir {
                             let child = join_utf16(dir_path, name_slice);
                             subdirs.push((child, rel_path.clone()));
                         }
@@ -431,7 +468,7 @@ mod windows {
             }
         });
 
-        Ok(shared.into_inner().unwrap_or_else(|err| err.into_inner()))
+        Ok(shared.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     /// One worker of the parallel walker. Grabs batches of directories from the
@@ -546,6 +583,53 @@ mod tests {
         assert_eq!(s.ino, 0);
         assert_eq!(s.uid, 0);
         assert_eq!(s.gid, 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn type_flags_match_std_symlink_metadata_semantics() {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT};
+
+        let flags = super::windows::type_flags_from_attributes;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+        const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+        const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+        const IO_REPARSE_TAG_CLOUD: u32 = 0x9000_001A;
+        const IO_REPARSE_TAG_WOF: u32 = 0x8000_0017;
+
+        // plain file / plain dir
+        assert_eq!(flags(FILE_ATTRIBUTE_NORMAL, 0), (false, false));
+        assert_eq!(flags(FILE_ATTRIBUTE_DIRECTORY, 0), (true, false));
+        // file and directory symlinks: symlink, never dir — like `std`
+        assert_eq!(
+            flags(FILE_ATTRIBUTE_REPARSE_POINT, IO_REPARSE_TAG_SYMLINK),
+            (false, true)
+        );
+        assert_eq!(
+            flags(
+                FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT,
+                IO_REPARSE_TAG_SYMLINK
+            ),
+            (false, true)
+        );
+        // junction (mount point): treated as symlink by `std`
+        assert_eq!(
+            flags(
+                FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT,
+                IO_REPARSE_TAG_MOUNT_POINT
+            ),
+            (false, true)
+        );
+        // non-surrogate reparse points are regular files/dirs (cloud placeholders, WOF)
+        assert_eq!(flags(FILE_ATTRIBUTE_REPARSE_POINT, IO_REPARSE_TAG_CLOUD), (false, false));
+        assert_eq!(
+            flags(
+                FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT,
+                IO_REPARSE_TAG_CLOUD
+            ),
+            (true, false)
+        );
+        assert_eq!(flags(FILE_ATTRIBUTE_REPARSE_POINT, IO_REPARSE_TAG_WOF), (false, false));
     }
 
     #[test]

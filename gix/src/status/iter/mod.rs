@@ -69,7 +69,7 @@ where
         // silently fall through to stat-based status rather than abort.
         #[cfg(windows)]
         let worktree_stats = if self.precompute_worktree_stats {
-            crate::status::precomputed_worktree_stats(self.repo, &index, None)
+            crate::status::precomputed_worktree_stats(self.repo, &index, self.index_worktree_options.thread_limit)
         } else {
             None
         };
