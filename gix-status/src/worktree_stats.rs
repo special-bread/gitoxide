@@ -335,18 +335,39 @@ mod windows {
                     let is_dir = (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
                     let is_reparse = (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 
-                    // Decode the UTF-16 name fallibly: skip on ill-formed sequences rather than
-                    // substituting U+FFFD. Lossy substitution can collapse two distinct invalid
-                    // names onto the same key (one overwriting the other in the map) and never
-                    // matches what `gix-index` stored anyway, so a miss + live `lstat` fallback
-                    // is strictly cleaner.
-                    if let Ok(name_str) = String::from_utf16(name_slice) {
-                        let rel_path = if rel_prefix.is_empty() {
-                            name_str
-                        } else {
-                            format!("{rel_prefix}/{name_str}")
-                        };
+                    // Build the worktree-relative path in a single allocation by decoding the
+                    // UTF-16 name straight into a string already holding `rel_prefix/`, instead
+                    // of materializing the name as its own `String` and then `format!`-ing a
+                    // second copy. This runs once per worktree entry (~90k on the Linux kernel),
+                    // so the extra allocation + copy per entry was a measurable slice of the walk.
+                    //
+                    // Decode fallibly: skip on ill-formed sequences rather than substituting
+                    // U+FFFD. Lossy substitution can collapse two distinct invalid names onto the
+                    // same key (one overwriting the other in the map) and never matches what
+                    // `gix-index` stored anyway, so a miss + live `lstat` fallback is strictly
+                    // cleaner. `char::decode_utf16` yields an error on an unpaired surrogate; we
+                    // drop the whole entry in that case.
+                    let prefix_len = if rel_prefix.is_empty() { 0 } else { rel_prefix.len() + 1 };
+                    // `name_len` is UTF-16 code units; for the ASCII paths that dominate git
+                    // worktrees that equals the UTF-8 byte count, so this reservation is exact and
+                    // non-ASCII names cost at most a single realloc.
+                    let mut rel_path = String::with_capacity(prefix_len + name_len);
+                    if !rel_prefix.is_empty() {
+                        rel_path.push_str(rel_prefix);
+                        rel_path.push('/');
+                    }
+                    let mut valid = true;
+                    for ch in char::decode_utf16(name_slice.iter().copied()) {
+                        match ch {
+                            Ok(ch) => rel_path.push(ch),
+                            Err(_) => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
 
+                    if valid {
                         let stat = stat_from_info(info);
                         if is_dir && !is_reparse {
                             let child = join_utf16(dir_path, name_slice);
