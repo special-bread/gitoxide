@@ -11,6 +11,7 @@
 //! correctness, since misses fall through to a live syscall.
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use bstr::BString;
 
@@ -161,8 +162,25 @@ impl FileMetadata<'_> {
 /// [`Context::worktree_stats`](crate::index_as_worktree::Context::worktree_stats)
 /// — hits skip per-file syscalls.
 ///
+/// `start_dir` seeds the walk at a worktree-relative directory (`/`-separated,
+/// no leading slash, trailing slash tolerated; empty walks the entire
+/// worktree). Use it to avoid walking unrelated subtrees when a pathspec
+/// restricts status to a known prefix — keys in the returned map are full
+/// worktree-relative paths either way. If `start_dir` doesn't name a directory
+/// on disk the map comes back empty, which is still correct: lookups miss and
+/// fall back to live syscalls.
+///
 /// `thread_limit` caps parallelism. `None` uses all available cores; `Some(1)`
 /// is single-threaded.
+///
+/// `should_interrupt` stops the walk early at directory granularity. Whatever
+/// was gathered until then is returned — a partial map is still a valid
+/// look-through map.
+///
+/// The walk does not descend into nested repositories: a directory containing
+/// a `.git` entry (other than the walk root) marks a submodule worktree or an
+/// embedded repository whose contents can't be tracked by this index. The
+/// directory itself still gets an entry, which is all submodule status needs.
 ///
 /// `make_excludes` is called once on each worker thread and returns a predicate
 /// that owns thread-local state (e.g. a `gix_worktree::Stack`). Each time the
@@ -172,12 +190,37 @@ impl FileMetadata<'_> {
 /// for typical projects with fat ignored dirs (`node_modules`, `target`) the
 /// wasted enumeration makes the preprocessing pass net-slower than plain
 /// per-file stats.
-pub fn prepare<F, E>(worktree: &Path, thread_limit: Option<usize>, make_excludes: F) -> std::io::Result<WorktreeStats>
+pub fn prepare<F, E>(
+    worktree: &Path,
+    start_dir: &bstr::BStr,
+    thread_limit: Option<usize>,
+    should_interrupt: &AtomicBool,
+    make_excludes: F,
+) -> std::io::Result<WorktreeStats>
 where
     F: Fn() -> E + Sync,
     E: FnMut(&bstr::BStr) -> bool,
 {
-    windows::walk_worktree_parallel(worktree, thread_limit, make_excludes)
+    windows::walk_worktree_parallel(worktree, start_dir, thread_limit, should_interrupt, make_excludes)
+}
+
+/// Like [`prepare`], but single-threaded and without the `Sync` requirement on
+/// the excludes predicate — for callers whose gitignore machinery can't be
+/// shared across threads, like `gix` built without its `parallel` feature.
+pub fn prepare_single_threaded<E>(
+    worktree: &Path,
+    start_dir: &bstr::BStr,
+    should_interrupt: &AtomicBool,
+    is_excluded: E,
+) -> std::io::Result<WorktreeStats>
+where
+    E: FnMut(&bstr::BStr) -> bool,
+{
+    windows::walk_worktree_single_threaded(
+        windows::seed_work_item(worktree, start_dir),
+        should_interrupt,
+        is_excluded,
+    )
 }
 
 /// Windows-specific implementation using `GetFileInformationByHandleEx` /
@@ -188,6 +231,7 @@ mod windows {
     use std::collections::VecDeque;
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
+    use std::sync::atomic::Ordering;
     use std::sync::{Condvar, Mutex};
     use std::thread;
 
@@ -290,6 +334,20 @@ mod windows {
         v
     }
 
+    /// Build the initial [`WorkItem`] for a walk of `worktree` seeded at the
+    /// worktree-relative directory `start_dir` (empty: the worktree root).
+    ///
+    /// A non-UTF-8 `start_dir` can't be turned into the `String` rel-prefix the
+    /// walker builds keys from (and `gix-pathspec` never produces one), so it
+    /// falls back to walking the whole tree — more work, never wrong.
+    pub(super) fn seed_work_item(worktree: &Path, start_dir: &bstr::BStr) -> WorkItem {
+        let start_dir = start_dir.strip_suffix(b"/").unwrap_or(start_dir);
+        match std::str::from_utf8(start_dir) {
+            Ok(rel) if !rel.is_empty() => (utf16_null_terminated(&worktree.join(rel)), rel.to_string()),
+            _ => (utf16_null_terminated(worktree), String::new()),
+        }
+    }
+
     /// Check if a UTF-16 name equals exactly ASCII ".git" (case-sensitive, matching the
     /// prior behaviour). This is intentional: on Windows a mis-cased `.Git` is the same
     /// file to the filesystem but conventionally never appears, and the preprocessing pass
@@ -312,9 +370,22 @@ mod windows {
     /// Returns (entries to record, subdirectories to recurse into). `buffer` is a
     /// reusable 64 KiB u64-aligned scratch buffer; reusing it across calls avoids
     /// a heap allocation per directory (6k+ per worktree on the Linux kernel).
-    fn walk_directory(dir_path: &[u16], rel_prefix: &str, buffer: &mut [u64]) -> std::io::Result<WalkResult> {
+    ///
+    /// A `.git` entry in a non-root directory marks a nested repository
+    /// (submodule worktree or embedded repo) — its contents are returned without
+    /// subdirectories to recurse into. The direct children stay in the map: the
+    /// nested root itself is what submodule status looks up, and in the odd case
+    /// of files tracked by the *outer* index inside such a directory, anything
+    /// deeper simply misses and falls back to a live `lstat`.
+    fn walk_directory(
+        dir_path: &[u16],
+        rel_prefix: &str,
+        is_root: bool,
+        buffer: &mut [u64],
+    ) -> std::io::Result<WalkResult> {
         let mut files = Vec::new();
         let mut subdirs = Vec::new();
+        let mut has_dotgit = false;
 
         let handle = unsafe {
             CreateFileW(
@@ -365,7 +436,9 @@ mod windows {
                 let is_dot = name_len == 1 && name_slice[0] == b'.' as u16;
                 let is_dotdot = name_len == 2 && name_slice[0] == b'.' as u16 && name_slice[1] == b'.' as u16;
 
-                if !is_dot && !is_dotdot && !name_is_dotgit(name_slice) {
+                if name_is_dotgit(name_slice) {
+                    has_dotgit = true;
+                } else if !is_dot && !is_dotdot {
                     // Recurse only into what the live pipeline would consider a directory:
                     // name-surrogate reparse points (junctions, directory symlinks) are
                     // symlinks to it and must not be followed — that's also what protects
@@ -422,6 +495,10 @@ mod windows {
         }
 
         unsafe { CloseHandle(handle) };
+
+        if has_dotgit && !is_root {
+            subdirs.clear();
+        }
         Ok((files, subdirs))
     }
 
@@ -435,7 +512,9 @@ mod windows {
     /// Walk the worktree using work-stealing parallelism.
     pub fn walk_worktree_parallel<F, E>(
         worktree: &Path,
+        start_dir: &bstr::BStr,
         thread_limit: Option<usize>,
+        should_interrupt: &AtomicBool,
         make_excludes: F,
     ) -> std::io::Result<WorktreeStats>
     where
@@ -450,12 +529,16 @@ mod windows {
             })
             .max(1);
 
+        let root = seed_work_item(worktree, start_dir);
         if num_threads == 1 {
-            return walk_worktree_single_threaded(worktree, make_excludes());
+            return walk_worktree_single_threaded(root, should_interrupt, make_excludes());
         }
 
+        // Only the root's `rel_prefix` ever equals this — child prefixes are strictly longer.
+        let root_rel = root.1.clone();
+        let root_rel = root_rel.as_str();
         let queue_mutex = Mutex::new(WorkQueue {
-            dirs: VecDeque::from([(utf16_null_terminated(worktree), String::new())]),
+            dirs: VecDeque::from([root]),
             active_workers: 0,
         });
         let cvar = Condvar::new();
@@ -464,7 +547,16 @@ mod windows {
         thread::scope(|s| {
             for _ in 0..num_threads {
                 let make_excludes = &make_excludes;
-                s.spawn(|| worker(&queue_mutex, &cvar, &shared, make_excludes()));
+                s.spawn(|| {
+                    worker(
+                        &queue_mutex,
+                        &cvar,
+                        &shared,
+                        root_rel,
+                        should_interrupt,
+                        make_excludes(),
+                    )
+                });
             }
         });
 
@@ -483,6 +575,8 @@ mod windows {
         queue_mutex: &Mutex<WorkQueue>,
         cvar: &Condvar,
         shared: &Mutex<WorktreeStats>,
+        root_rel: &str,
+        should_interrupt: &AtomicBool,
         mut is_excluded: E,
     ) {
         let mut local = WorktreeStats::default();
@@ -494,6 +588,11 @@ mod windows {
             {
                 let mut queue = queue_mutex.lock().unwrap();
                 loop {
+                    if should_interrupt.load(Ordering::Relaxed) {
+                        // Drop pending work — with the queue empty, every worker exits
+                        // through the regular done-path once in-flight batches finish.
+                        queue.dirs.clear();
+                    }
                     // Steal up to half of the queue (capped) to reduce re-locking while
                     // still leaving work for other threads to pick up.
                     let take = queue.dirs.len().div_ceil(2).min(32);
@@ -515,7 +614,11 @@ mod windows {
             // Process the claimed directories outside the lock.
             let mut new_dirs: Vec<WorkItem> = Vec::new();
             while let Some((dir, rel_prefix)) = local_stack.pop() {
-                if let Ok((files, subdirs)) = walk_directory(&dir, &rel_prefix, &mut buffer) {
+                if should_interrupt.load(Ordering::Relaxed) {
+                    local_stack.clear();
+                    break;
+                }
+                if let Ok((files, subdirs)) = walk_directory(&dir, &rel_prefix, rel_prefix == root_rel, &mut buffer) {
                     local.extend(files);
                     for (child_path, child_rel) in subdirs {
                         if !is_excluded(child_rel.as_bytes().into()) {
@@ -534,16 +637,21 @@ mod windows {
     }
 
     /// Simple single-threaded walk for thread_limit=1.
-    fn walk_worktree_single_threaded<E: FnMut(&bstr::BStr) -> bool>(
-        worktree: &Path,
+    pub(super) fn walk_worktree_single_threaded<E: FnMut(&bstr::BStr) -> bool>(
+        root: WorkItem,
+        should_interrupt: &AtomicBool,
         mut is_excluded: E,
     ) -> std::io::Result<WorktreeStats> {
         let mut stats = WorktreeStats::default();
-        let mut dir_stack: Vec<WorkItem> = vec![(utf16_null_terminated(worktree), String::new())];
+        let root_rel = root.1.clone();
+        let mut dir_stack: Vec<WorkItem> = vec![root];
         let mut buffer = vec![0u64; BUFFER_U64S];
 
         while let Some((dir, rel_prefix)) = dir_stack.pop() {
-            if let Ok((files, subdirs)) = walk_directory(&dir, &rel_prefix, &mut buffer) {
+            if should_interrupt.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Ok((files, subdirs)) = walk_directory(&dir, &rel_prefix, rel_prefix == root_rel, &mut buffer) {
                 stats.extend(files);
                 for (child_path, child_rel) in subdirs {
                     if !is_excluded(child_rel.as_bytes().into()) {
@@ -621,7 +729,10 @@ mod tests {
             (false, true)
         );
         // non-surrogate reparse points are regular files/dirs (cloud placeholders, WOF)
-        assert_eq!(flags(FILE_ATTRIBUTE_REPARSE_POINT, IO_REPARSE_TAG_CLOUD), (false, false));
+        assert_eq!(
+            flags(FILE_ATTRIBUTE_REPARSE_POINT, IO_REPARSE_TAG_CLOUD),
+            (false, false)
+        );
         assert_eq!(
             flags(
                 FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT,
@@ -651,13 +762,25 @@ mod tests {
         assert!(stats.get("ünïcode.txt".as_bytes()).is_some());
     }
 
-    #[test]
-    fn prepare_returns_stats() {
-        // Use a unique temp directory to avoid walking other files.
+    fn unique_temp_dir() -> std::path::PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let temp_dir = std::env::temp_dir().join(format!("gix_status_test_{timestamp}"));
         std::fs::create_dir_all(&temp_dir).unwrap();
+        temp_dir
+    }
+
+    fn prepare_simple(worktree: &Path, start_dir: &str) -> WorktreeStats {
+        prepare(worktree, start_dir.into(), Some(1), &AtomicBool::new(false), || {
+            |_: &bstr::BStr| false
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn prepare_returns_stats() {
+        // Use a unique temp directory to avoid walking other files.
+        let temp_dir = unique_temp_dir();
 
         let test_file = temp_dir.join("test.txt");
         std::fs::write(&test_file, b"hello").unwrap();
@@ -667,11 +790,58 @@ mod tests {
         let nested_file = subdir.join("nested.txt");
         std::fs::write(&nested_file, b"world").unwrap();
 
-        let stats = prepare(&temp_dir, Some(1), || |_: &bstr::BStr| false).unwrap();
-
+        let stats = prepare_simple(&temp_dir, "");
         assert!(!stats.is_empty());
         assert!(stats.contains_key(&b"test.txt"[..]));
         assert!(stats.contains_key(&b"subdir/nested.txt"[..]));
+
+        // Seeded at a subdirectory: keys stay worktree-relative, unrelated files are not walked.
+        let stats = prepare_simple(&temp_dir, "subdir");
+        assert!(stats.contains_key(&b"subdir/nested.txt"[..]));
+        assert!(!stats.contains_key(&b"test.txt"[..]));
+        // Trailing slash and missing directories degrade to (partial) maps, never errors.
+        let stats = prepare_simple(&temp_dir, "subdir/");
+        assert!(stats.contains_key(&b"subdir/nested.txt"[..]));
+        assert!(prepare_simple(&temp_dir, "does-not-exist").is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn nested_repositories_are_not_descended_into() {
+        let temp_dir = unique_temp_dir();
+
+        let nested = temp_dir.join("nested");
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        std::fs::create_dir_all(nested.join("sub")).unwrap();
+        std::fs::write(nested.join("file.txt"), b"direct child").unwrap();
+        std::fs::write(nested.join("sub").join("deep.txt"), b"below nested root").unwrap();
+
+        let stats = prepare_simple(&temp_dir, "");
+        // The nested root and its direct children are recorded — the former is what
+        // submodule status looks up — but nothing below its subdirectories.
+        assert!(stats.contains_key(&b"nested"[..]));
+        assert!(stats.contains_key(&b"nested/file.txt"[..]));
+        assert!(stats.contains_key(&b"nested/sub"[..]));
+        assert!(!stats.contains_key(&b"nested/sub/deep.txt"[..]));
+        assert!(!stats.contains_key(&b"nested/.git"[..]));
+
+        // Seeded *at* the nested repo, it is the walk root and is walked normally,
+        // matching a status run inside the nested repo's own worktree.
+        let stats = prepare_simple(&temp_dir, "nested");
+        assert!(stats.contains_key(&b"nested/sub/deep.txt"[..]));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn interrupt_stops_the_walk_early() {
+        let temp_dir = unique_temp_dir();
+        std::fs::write(temp_dir.join("file.txt"), b"content").unwrap();
+
+        let interrupted = AtomicBool::new(true);
+        let stats = prepare(&temp_dir, "".into(), Some(1), &interrupted, || |_: &bstr::BStr| false).unwrap();
+        assert!(stats.is_empty(), "pre-set interrupt yields an empty (valid) map");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

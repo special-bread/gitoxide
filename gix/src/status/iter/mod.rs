@@ -65,14 +65,8 @@ where
             .unwrap_or_default();
         let should_interrupt = self.should_interrupt.clone().unwrap_or_default();
         let submodule = BuiltinSubmoduleStatus::new(self.repo.clone().into_sync(), self.submodules)?;
-        // Best-effort: if the prep walk fails (missing workdir, syscall error),
-        // silently fall through to stat-based status rather than abort.
         #[cfg(windows)]
-        let worktree_stats = if self.precompute_worktree_stats {
-            crate::status::precomputed_worktree_stats(self.repo, &index, self.index_worktree_options.thread_limit)
-        } else {
-            None
-        };
+        let precompute_worktree_stats = self.precompute_worktree_stats;
         #[cfg(feature = "parallel")]
         {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -133,6 +127,29 @@ where
                     let mut progress = self.progress;
                     move || -> Result<_, index_worktree::Error> {
                         let repo = repo.to_thread_local();
+                        // Run the preprocessing walk on this thread so it overlaps with the
+                        // tree-index producer instead of delaying both. Best-effort: if it
+                        // fails (missing workdir, syscall error), silently fall through to
+                        // stat-based status rather than abort.
+                        #[cfg(windows)]
+                        let worktree_stats = precompute_worktree_stats
+                            .then(|| {
+                                let pathspec = repo
+                                    .index_worktree_status_pathspec::<index_worktree::Error>(
+                                        &patterns,
+                                        &index,
+                                        options.dirwalk_options.as_ref(),
+                                    )
+                                    .ok()?;
+                                crate::status::precomputed_worktree_stats(
+                                    &repo,
+                                    &index,
+                                    pathspec.search.common_prefix(),
+                                    options.thread_limit,
+                                    &should_interrupt,
+                                )
+                            })
+                            .flatten();
                         let out = repo.index_worktree_status(
                             &index,
                             patterns,
@@ -198,6 +215,26 @@ where
                 }
                 None => (Vec::new(), None),
             };
+            // Best-effort, like in the parallel branch above.
+            #[cfg(windows)]
+            let worktree_stats = precompute_worktree_stats
+                .then(|| {
+                    let pathspec = repo
+                        .index_worktree_status_pathspec::<crate::status::into_iter::Error>(
+                            &patterns,
+                            &index,
+                            options.dirwalk_options.as_ref(),
+                        )
+                        .ok()?;
+                    crate::status::precomputed_worktree_stats(
+                        repo,
+                        &index,
+                        pathspec.search.common_prefix(),
+                        options.thread_limit,
+                        &should_interrupt,
+                    )
+                })
+                .flatten();
             let out = repo.index_worktree_status(
                 &index,
                 patterns,
