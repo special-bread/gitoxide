@@ -304,6 +304,25 @@ mod windows {
         (is_dir, is_symlink)
     }
 
+    /// Read a record's UTF-16 `FileName` without assuming the record is aligned.
+    ///
+    /// `FILE_ID_BOTH_DIR_INFO` records can be returned at unaligned offsets by some
+    /// filesystem drivers (see the call site and rust-lang/rust#104530), so forming a
+    /// `&[u16]` over the buffer would be UB. Borrow in place in the common aligned case;
+    /// copy element-by-element with unaligned reads otherwise. Mirrors std's
+    /// `from_maybe_unaligned` helper.
+    ///
+    /// # Safety
+    ///
+    /// `p` must point at `len` `u16`s of an in-bounds, initialized directory record.
+    unsafe fn name_from_maybe_unaligned<'a>(p: *const u16, len: usize) -> std::borrow::Cow<'a, [u16]> {
+        if p.is_aligned() {
+            std::borrow::Cow::Borrowed(unsafe { std::slice::from_raw_parts(p, len) })
+        } else {
+            std::borrow::Cow::Owned((0..len).map(|i| unsafe { p.add(i).read_unaligned() }).collect())
+        }
+    }
+
     /// Convert a Windows FILETIME (100ns intervals since 1601-01-01 UTC) to Unix (secs, nsecs).
     fn filetime_to_unix(ft: u64) -> (u32, u32) {
         const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
@@ -424,14 +443,26 @@ mod windows {
 
             let mut offset = 0usize;
             loop {
-                // Alignment is guaranteed: the buffer is `Vec<u64>` (8-byte aligned) and the
-                // kernel emits entries at 8-byte-aligned `NextEntryOffset`s within it.
+                // The buffer is `Vec<u64>` (8-byte aligned), but only the *first* record is
+                // guaranteed aligned: subsequent records sit at `offset += NextEntryOffset`,
+                // and while the docs say those offsets are aligned, some filesystem drivers
+                // return them unaligned in practice. Forming `&*info_ptr` over an unaligned
+                // record is instant UB (and has crashed callers), so read the fixed header by
+                // value with an unaligned read and copy the name out when it isn't aligned.
+                // std hit and worked around the same `FileIdBothDirectoryInfo` issue:
+                // rust-lang/rust#104530.
+                //
+                // The cast to a more-aligned pointer type is sound here precisely because we
+                // never dereference it as aligned — only `read_unaligned` / `&raw const`.
                 #[allow(clippy::cast_ptr_alignment)]
                 let info_ptr = unsafe { buffer.as_ptr().cast::<u8>().add(offset).cast::<FILE_ID_BOTH_DIR_INFO>() };
-                let info = unsafe { &*info_ptr };
+                let info = unsafe { info_ptr.read_unaligned() };
+                let info = &info;
 
                 let name_len = (info.FileNameLength / 2) as usize;
-                let name_slice = unsafe { std::slice::from_raw_parts(info.FileName.as_ptr(), name_len) };
+                let name_ptr = unsafe { (&raw const (*info_ptr).FileName).cast::<u16>() };
+                let name = unsafe { name_from_maybe_unaligned(name_ptr, name_len) };
+                let name_slice: &[u16] = &name;
 
                 let is_dot = name_len == 1 && name_slice[0] == b'.' as u16;
                 let is_dotdot = name_len == 2 && name_slice[0] == b'.' as u16 && name_slice[1] == b'.' as u16;
